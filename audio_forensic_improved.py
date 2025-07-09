@@ -4,27 +4,88 @@
 Audio Forensic Analysis Script - Improved Version
 ================================================
 Enhanced version with bug fixes and performance improvements
+Cross-platform compatibility improvements
 """
 
 import os
+import sys
+import platform
+import shutil
 import json
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.io import wavfile
-from scipy.signal import spectrogram, find_peaks
-from scipy.fftpack import dct
-import whisper
 import csv
 import hashlib
-from fpdf import FPDF
-import pandas as pd
-import psutil
 import subprocess
 import gc
-from tqdm import tqdm
 import functools
 import logging
 from typing import Dict, List, Tuple, Optional
+
+# Try to import required packages with better error handling
+try:
+    import numpy as np
+except ImportError as e:
+    print(f"❌ Erro: numpy não encontrado. Instale com: pip install numpy")
+    sys.exit(1)
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend for better compatibility
+    import matplotlib.pyplot as plt
+except ImportError as e:
+    print(f"❌ Erro: matplotlib não encontrado. Instale com: pip install matplotlib")
+    sys.exit(1)
+
+try:
+    from scipy.io import wavfile
+    from scipy.signal import spectrogram, find_peaks
+    from scipy.fftpack import dct
+except ImportError as e:
+    print(f"❌ Erro: scipy não encontrado. Instale com: pip install scipy")
+    sys.exit(1)
+
+try:
+    import pandas as pd
+except ImportError as e:
+    print(f"❌ Erro: pandas não encontrado. Instale com: pip install pandas")
+    sys.exit(1)
+
+try:
+    import psutil
+except ImportError as e:
+    print(f"❌ Erro: psutil não encontrado. Instale com: pip install psutil")
+    sys.exit(1)
+
+try:
+    from tqdm import tqdm
+except ImportError as e:
+    print(f"❌ Erro: tqdm não encontrado. Instale com: pip install tqdm")
+    sys.exit(1)
+
+try:
+    from fpdf import FPDF
+except ImportError as e:
+    print(f"❌ Erro: fpdf2 não encontrado. Instale com: pip install fpdf2")
+    sys.exit(1)
+
+# Optional imports with fallback
+WHISPER_AVAILABLE = True
+try:
+    import whisper
+except ImportError as e:
+    WHISPER_AVAILABLE = False
+    print(f"⚠️  Aviso: Whisper não encontrado. Transcrição será desabilitada.")
+    print(f"   Instale com: pip install openai-whisper")
+    
+    # Create a dummy whisper module for compatibility
+    class DummyWhisper:
+        @staticmethod
+        def load_model(*args, **kwargs):
+            return None
+        @staticmethod
+        def transcribe(*args, **kwargs):
+            return {"text": "[Transcrição indisponível - Whisper não instalado]"}
+    
+    whisper = DummyWhisper()
 
 # === CONFIGURAÇÕES ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -71,11 +132,61 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # === FUNÇÕES DE VERIFICAÇÃO ===
+def verificar_plataforma():
+    """Check platform and provide platform-specific configurations"""
+    sistema = platform.system().lower()
+    plataforma_info = {
+        'sistema': sistema,
+        'versao': platform.release(),
+        'arquitetura': platform.machine(),
+        'python_version': platform.python_version(),
+        'is_windows': sistema == 'windows',
+        'is_linux': sistema == 'linux',
+        'is_macos': sistema == 'darwin'
+    }
+    
+    logger.info(f"🖥️  Sistema detectado: {plataforma_info['sistema']} {plataforma_info['versao']}")
+    logger.info(f"🐍 Python {plataforma_info['python_version']} ({plataforma_info['arquitetura']})")
+    
+    return plataforma_info
+
+def verificar_ffmpeg():
+    """Check if FFmpeg is available and accessible"""
+    try:
+        # Try to find ffmpeg in PATH
+        ffmpeg_path = shutil.which('ffmpeg')
+        if not ffmpeg_path:
+            return False, "FFmpeg não encontrado no PATH do sistema"
+        
+        # Test if ffmpeg is actually working
+        result = subprocess.run(
+            [ffmpeg_path, '-version'], 
+            capture_output=True, 
+            text=True, 
+            timeout=10
+        )
+        
+        if result.returncode == 0:
+            # Extract version info
+            version_line = result.stdout.split('\n')[0]
+            logger.info(f"✅ FFmpeg encontrado: {version_line}")
+            return True, ffmpeg_path
+        else:
+            return False, f"FFmpeg não está funcionando corretamente: {result.stderr}"
+            
+    except subprocess.TimeoutExpired:
+        return False, "FFmpeg não responde (timeout)"
+    except Exception as e:
+        return False, f"Erro ao verificar FFmpeg: {str(e)}"
+
 def verificar_dependencias():
     """Check if all required dependencies are available"""
+    plataforma = verificar_plataforma()
+    
+    # Check Python packages
     required_packages = [
-        'whisper', 'scipy', 'matplotlib', 'pandas', 
-        'psutil', 'fpdf', 'tqdm', 'numpy'
+        'numpy', 'scipy', 'matplotlib', 'pandas', 
+        'psutil', 'fpdf', 'tqdm'
     ]
     
     missing = []
@@ -88,7 +199,38 @@ def verificar_dependencias():
     if missing:
         raise ImportError(f"Pacotes em falta: {', '.join(missing)}")
     
+    # Check FFmpeg
+    ffmpeg_ok, ffmpeg_info = verificar_ffmpeg()
+    if not ffmpeg_ok:
+        error_msg = f"❌ FFmpeg não disponível: {ffmpeg_info}\n"
+        if plataforma['is_windows']:
+            error_msg += "   Baixe FFmpeg de: https://ffmpeg.org/download.html\n"
+            error_msg += "   Ou instale com: winget install ffmpeg"
+        elif plataforma['is_linux']:
+            error_msg += "   Instale com: sudo apt-get install ffmpeg (Ubuntu/Debian)\n"
+            error_msg += "   Ou: sudo yum install ffmpeg (CentOS/RHEL)"
+        elif plataforma['is_macos']:
+            error_msg += "   Instale com: brew install ffmpeg"
+        
+        raise RuntimeError(error_msg)
+    
+    # Check Whisper availability
+    if not WHISPER_AVAILABLE:
+        logger.warning("⚠️  Whisper não disponível - transcrição será limitada")
+        logger.warning("   Instale com: pip install openai-whisper")
+    
+    # Check write permissions
+    try:
+        test_file = os.path.join(PASTA_OUT, 'test_write.tmp')
+        with open(test_file, 'w', encoding='utf-8') as f:
+            f.write('test')
+        os.remove(test_file)
+        logger.info("✅ Permissões de escrita verificadas")
+    except Exception as e:
+        raise PermissionError(f"Erro de permissão no diretório de saída: {e}")
+    
     logger.info("✅ Todas as dependências verificadas")
+    return plataforma
 
 def verificar_memoria_detalhada():
     """Enhanced memory monitoring"""
@@ -123,40 +265,83 @@ def validar_caminho_arquivo(path: str) -> str:
     return resolved
 
 # === FUNÇÃO DE CONVERSÃO APRIMORADA ===
-def converter_audio_safe(input_path: str, output_path: str) -> bool:
-    """Enhanced audio conversion with better error handling"""
+def converter_audio_safe(input_path: str, output_path: str, plataforma_info: Dict = None) -> bool:
+    """Enhanced audio conversion with better error handling and platform support"""
     try:
         # Validate input file
         validar_caminho_arquivo(input_path)
         
+        # Get FFmpeg path (platform-specific)
+        ffmpeg_cmd = 'ffmpeg'
+        if plataforma_info and plataforma_info.get('is_windows'):
+            # On Windows, might need .exe extension
+            if shutil.which('ffmpeg.exe'):
+                ffmpeg_cmd = 'ffmpeg.exe'
+        
+        # Build command with cross-platform compatibility
         command = [
-            'ffmpeg', '-y',  # Overwrite output files
+            ffmpeg_cmd, '-y',  # Overwrite output files
             '-i', input_path,
             '-ar', str(CONFIG['audio']['sample_rate']),
             '-ac', str(CONFIG['audio']['channels']),
             '-acodec', 'pcm_s16le',  # Specify codec
+            '-loglevel', 'error',  # Reduce verbose output
             output_path
         ]
+        
+        # Platform-specific adjustments
+        env = os.environ.copy()
+        if plataforma_info and plataforma_info.get('is_windows'):
+            # On Windows, ensure proper encoding
+            env['PYTHONIOENCODING'] = 'utf-8'
         
         result = subprocess.run(
             command, 
             capture_output=True, 
             text=True, 
             check=True,
-            timeout=300  # 5 minute timeout
+            timeout=300,  # 5 minute timeout
+            env=env,
+            encoding='utf-8',  # Explicit encoding
+            errors='replace'  # Handle encoding errors gracefully
         )
+        
+        # Verify output file was created and has content
+        if not os.path.exists(output_path):
+            logger.error(f"❌ Arquivo de saída não foi criado: {output_path}")
+            return False
+        
+        if os.path.getsize(output_path) == 0:
+            logger.error(f"❌ Arquivo de saída está vazio: {output_path}")
+            return False
         
         logger.info(f"✅ Conversão bem-sucedida: {os.path.basename(input_path)}")
         return True
         
     except subprocess.CalledProcessError as e:
-        logger.error(f"❌ FFmpeg falhou para {input_path}: {e.stderr}")
+        error_msg = e.stderr if e.stderr else str(e)
+        logger.error(f"❌ FFmpeg falhou para {input_path}: {error_msg}")
+        
+        # Provide platform-specific troubleshooting
+        if plataforma_info:
+            if plataforma_info.get('is_windows') and "codec" in error_msg.lower():
+                logger.error("   Dica: Verifique se sua versão do FFmpeg suporta PCM")
+            elif "permission" in error_msg.lower():
+                logger.error("   Dica: Verifique permissões de arquivo e diretório")
+        
         return False
+        
     except subprocess.TimeoutExpired:
         logger.error(f"❌ Timeout na conversão de {input_path}")
+        logger.error("   Arquivo pode ser muito grande ou corrompido")
         return False
+        
+    except FileNotFoundError:
+        logger.error(f"❌ FFmpeg não encontrado. Instale FFmpeg primeiro.")
+        return False
+        
     except Exception as e:
-        logger.error(f"❌ Erro na conversão de {input_path}: {e}")
+        logger.error(f"❌ Erro inesperado na conversão de {input_path}: {e}")
         return False
 
 # === CARREGAR ARQUIVOS PROCESSADOS ===
@@ -175,33 +360,76 @@ def carregar_arquivos_processados() -> set:
 # === INICIALIZAR WHISPER COM CACHE ===
 @functools.lru_cache(maxsize=1)
 def get_whisper_model():
-    """Get Whisper model with caching"""
-    logger.info("🤖 Carregando modelo Whisper...")
-    model = whisper.load_model(
-        CONFIG['whisper']['model'], 
-        device=CONFIG['whisper']['device']
-    )
-    logger.info("✅ Modelo Whisper carregado")
-    return model
+    """Get Whisper model with caching and fallback handling"""
+    if not WHISPER_AVAILABLE:
+        logger.warning("🤖 Whisper não disponível - retornando modelo dummy")
+        return None
+    
+    try:
+        logger.info("🤖 Carregando modelo Whisper...")
+        model = whisper.load_model(
+            CONFIG['whisper']['model'], 
+            device=CONFIG['whisper']['device']
+        )
+        logger.info("✅ Modelo Whisper carregado")
+        return model
+    except Exception as e:
+        logger.error(f"❌ Erro ao carregar Whisper: {e}")
+        logger.warning("   Continuando sem transcrição...")
+        return None
 
 # === CARREGAR CONFIGURAÇÕES ===
 def carregar_configuracoes():
-    """Load LIWC categories and text data"""
+    """Load LIWC categories and text data with improved encoding handling"""
+    # Load LIWC categories
     try:
-        with open(CATEGORIAS_JSON, "r", encoding="utf-8") as f:
-            liwc_categorias = json.load(f)
-        logger.info("✅ Categorias LIWC carregadas")
+        # Try different encodings for cross-platform compatibility
+        encodings_to_try = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252']
+        liwc_categorias = {}
+        
+        for encoding in encodings_to_try:
+            try:
+                with open(CATEGORIAS_JSON, "r", encoding=encoding) as f:
+                    liwc_categorias = json.load(f)
+                logger.info(f"✅ Categorias LIWC carregadas (encoding: {encoding})")
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+            except FileNotFoundError:
+                break
+        
+        if not liwc_categorias and os.path.exists(CATEGORIAS_JSON):
+            logger.warning("⚠️  Erro de encoding no arquivo LIWC, usando categorias vazias")
+            
     except FileNotFoundError:
         logger.warning("⚠️  Arquivo LIWC não encontrado, usando categorias vazias")
         liwc_categorias = {}
+    except Exception as e:
+        logger.error(f"❌ Erro ao carregar LIWC: {e}")
+        liwc_categorias = {}
     
+    # Load text data
     try:
         if os.path.exists(TEXTO_CSV):
-            texto_df = pd.read_csv(TEXTO_CSV)
-            logger.info(f"✅ Base de texto carregada: {len(texto_df)} entradas")
+            # Try different encodings for CSV file
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252']
+            texto_df = None
+            
+            for encoding in encodings_to_try:
+                try:
+                    texto_df = pd.read_csv(TEXTO_CSV, encoding=encoding)
+                    logger.info(f"✅ Base de texto carregada: {len(texto_df)} entradas (encoding: {encoding})")
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            
+            if texto_df is None:
+                logger.warning("⚠️  Erro de encoding no arquivo CSV, criando nova base")
+                texto_df = pd.DataFrame(columns=["timestamp", "mensagem", "categoria"])
         else:
             texto_df = pd.DataFrame(columns=["timestamp", "mensagem", "categoria"])
             logger.info("ℹ️  Base de texto não encontrada, criando nova")
+            
     except Exception as e:
         logger.error(f"❌ Erro ao carregar base de texto: {e}")
         texto_df = pd.DataFrame(columns=["timestamp", "mensagem", "categoria"])
@@ -377,7 +605,7 @@ Padrões emocionais identificados:
 
 # === PROCESSAMENTO PRINCIPAL APRIMORADO ===
 def processar_audio_aprimorado(path: str, pbar: tqdm, liwc_categorias: Dict, 
-                              total_files: int) -> Optional[Dict]:
+                              total_files: int, plataforma_info: Dict = None) -> Optional[Dict]:
     """Enhanced audio processing with better error handling and progress tracking"""
     try:
         # Verificar memória antes de processar
@@ -389,8 +617,8 @@ def processar_audio_aprimorado(path: str, pbar: tqdm, liwc_categorias: Dict,
         # Atualizar progresso
         pbar.set_description(f"🔄 Convertendo: {base}")
         
-        # Converter áudio
-        if not converter_audio_safe(path, converted_path):
+        # Converter áudio com informações da plataforma
+        if not converter_audio_safe(path, converted_path, plataforma_info):
             logger.error(f"❌ Falha na conversão: {base}")
             return None
         
@@ -435,30 +663,36 @@ def processar_audio_aprimorado(path: str, pbar: tqdm, liwc_categorias: Dict,
         pbar.set_description(f"🗣️  Transcrevendo: {base}")
         try:
             model = get_whisper_model()
-            result = model.transcribe(
-                converted_path, 
-                language=CONFIG['whisper']['language'],
-                word_timestamps=True,
-                fp16=CONFIG['whisper']['fp16'],
-                beam_size=CONFIG['whisper']['beam_size']
-            )
-            transcricao = result["text"]
-            categoria = categorizar_audio(transcricao, liwc_categorias)
-            
-            # Gerar arquivo SRT
-            srt_path = os.path.join(PASTA_OUT, base + ".srt")
-            with open(srt_path, "w", encoding="utf-8") as srt_file:
-                for i, segment in enumerate(result["segments"]):
-                    start = segment["start"]
-                    end = segment["end"]
-                    text = segment["text"].strip()
-                    srt_file.write(f"{i+1}\n")
-                    srt_file.write(f"{formatar_tempo(start)} --> {formatar_tempo(end)}\n")
-                    srt_file.write(f"{text}\n\n")
+            if model is None:
+                # Whisper não disponível
+                transcricao = "[Transcrição indisponível - Whisper não instalado]"
+                categoria = "whisper_indisponivel"
+                result = {"segments": []}
+            else:
+                result = model.transcribe(
+                    converted_path, 
+                    language=CONFIG['whisper']['language'],
+                    word_timestamps=True,
+                    fp16=CONFIG['whisper']['fp16'],
+                    beam_size=CONFIG['whisper']['beam_size']
+                )
+                transcricao = result["text"]
+                categoria = categorizar_audio(transcricao, liwc_categorias)
+                
+                # Gerar arquivo SRT apenas se Whisper estiver disponível
+                srt_path = os.path.join(PASTA_OUT, base + ".srt")
+                with open(srt_path, "w", encoding="utf-8") as srt_file:
+                    for i, segment in enumerate(result["segments"]):
+                        start = segment["start"]
+                        end = segment["end"]
+                        text = segment["text"].strip()
+                        srt_file.write(f"{i+1}\n")
+                        srt_file.write(f"{formatar_tempo(start)} --> {formatar_tempo(end)}\n")
+                        srt_file.write(f"{text}\n\n")
             
         except Exception as e:
             logger.error(f"❌ Erro na transcrição de {base}: {e}")
-            transcricao = ""
+            transcricao = f"[Erro na transcrição: {str(e)}]"
             categoria = "erro_transcricao"
             result = {"segments": []}
         
@@ -497,8 +731,8 @@ def main():
     logger.info("🚀 Iniciando análise forense de áudio")
     
     try:
-        # Verificar dependências
-        verificar_dependencias()
+        # Verificar dependências e plataforma
+        plataforma_info = verificar_dependencias()
         
         # Carregar configurações
         liwc_categorias, texto_df = carregar_configuracoes()
@@ -507,6 +741,7 @@ def main():
         # Encontrar arquivos para processar
         if not os.path.exists(PASTA):
             logger.error(f"❌ Diretório de entrada não encontrado: {PASTA}")
+            logger.error(f"   Crie o diretório: {PASTA}")
             return
         
         files_to_process = [
@@ -534,7 +769,7 @@ def main():
                 
                 try:
                     resultado = processar_audio_aprimorado(
-                        file_path, pbar, liwc_categorias, len(files_to_process)
+                        file_path, pbar, liwc_categorias, len(files_to_process), plataforma_info
                     )
                     if resultado:
                         resultados.append(resultado)
@@ -544,34 +779,64 @@ def main():
         
         # Salvar resultados
         if resultados:
-            # Salvar CSV detalhado
-            with open(LOG_CSV, mode="w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "arquivo", "duração_s", "picos", "zonas_silencio", 
-                    "hash", "categoria"
-                ] + [f"mfcc_{i}" for i in range(13)])
-                
-                for r in resultados:
+            # Salvar CSV detalhado com tratamento de encoding
+            try:
+                with open(LOG_CSV, mode="w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
                     writer.writerow([
-                        r["arquivo"], r["duração_s"], r["picos"], 
-                        r["zonas_silencio"], r["hash"], r["categoria"]
-                    ] + r["fingerprint"])
+                        "arquivo", "duração_s", "picos", "zonas_silencio", 
+                        "hash", "categoria"
+                    ] + [f"mfcc_{i}" for i in range(13)])
+                    
+                    for r in resultados:
+                        writer.writerow([
+                            r["arquivo"], r["duração_s"], r["picos"], 
+                            r["zonas_silencio"], r["hash"], r["categoria"]
+                        ] + r["fingerprint"])
+                
+                logger.info(f"✅ CSV detalhado salvo: {LOG_CSV}")
+            except Exception as e:
+                logger.error(f"❌ Erro ao salvar CSV detalhado: {e}")
             
-            # Salvar sumário
-            sumario_df = pd.DataFrame(resultados)
-            sumario_df.to_csv(SUMARIO_CSV, index=False)
+            # Salvar sumário com tratamento de encoding
+            try:
+                sumario_df = pd.DataFrame(resultados)
+                sumario_df.to_csv(SUMARIO_CSV, index=False, encoding="utf-8")
+                logger.info(f"✅ Sumário salvo: {SUMARIO_CSV}")
+            except Exception as e:
+                logger.error(f"❌ Erro ao salvar sumário: {e}")
             
             # Gerar padrões emocionais
-            padroes = identificar_padroes_textuais(texto_df)
+            try:
+                padroes = identificar_padroes_textuais(texto_df)
+            except Exception as e:
+                logger.error(f"❌ Erro ao gerar padrões emocionais: {e}")
             
             logger.info(f"✅ Processamento concluído! {len(resultados)} arquivos processados")
             logger.info(f"📂 Resultados salvos em: {PASTA_OUT}")
         else:
             logger.warning("⚠️  Nenhum arquivo foi processado com sucesso")
+            logger.warning("   Verifique se:")
+            logger.warning("   - Os arquivos de áudio estão no diretório correto")
+            logger.warning("   - FFmpeg está instalado e funcionando")
+            logger.warning("   - Há permissões de escrita no diretório de saída")
             
     except Exception as e:
         logger.error(f"❌ Erro crítico: {e}")
+        
+        # Provide platform-specific troubleshooting
+        if plataforma_info:
+            logger.error("💡 Dicas de solução de problemas:")
+            if plataforma_info.get('is_windows'):
+                logger.error("   - Verifique se o FFmpeg está no PATH do Windows")
+                logger.error("   - Execute como administrador se necessário")
+            elif plataforma_info.get('is_linux'):
+                logger.error("   - Verifique permissões: chmod +x audio_forensic_improved.py")
+                logger.error("   - Instale dependências: sudo apt-get install ffmpeg")
+            elif plataforma_info.get('is_macos'):
+                logger.error("   - Instale FFmpeg: brew install ffmpeg")
+                logger.error("   - Verifique permissões de segurança do macOS")
+        
         raise
 
 if __name__ == "__main__":
